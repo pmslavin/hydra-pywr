@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 
 from pywr.nodes import (
+    Loadable,
     NodeMeta,
     Link,
     Input,
@@ -57,7 +58,7 @@ class ProportionalInput(Input, metaclass=NodeMeta):
             self.aggregated_node.factors = factors
 
 
-class LinearStorageReleaseControl(Link, metaclass=NodeMeta):
+class LinearStorageReleaseControl(Link, Loadable, metaclass=NodeMeta):
     """ A specialised node that provides a default max_flow based on a release rule. """
 
     def __init__(self, model, name, storage_node, release_values, scenario=None, **kwargs):
@@ -114,7 +115,6 @@ class LinearStorageReleaseControl(Link, metaclass=NodeMeta):
         node.cost = cost
         node.min_flow = min_flow
 
-        #breakpoint()
         return node
 
 
@@ -165,7 +165,6 @@ class Reservoir(Storage, metaclass=NodeMeta):
         if volumes is not None and areas is not None:
             node.area = InterpolatedVolumeParameter(model, node, volumes, areas)
 
-        #breakpoint()
         return node
 
 
@@ -203,7 +202,6 @@ class Reservoir(Storage, metaclass=NodeMeta):
                 log.warning(f"Please specify a bathymetry or level on node {self.name}")
                 levels = None
 
-        #breakpoint()
         if volumes is not None and levels is not None:
             self.level = InterpolatedVolumeParameter(self.model, self, volumes, levels)
 
@@ -291,7 +289,10 @@ class Reservoir(Storage, metaclass=NodeMeta):
 
 
 
-class Turbine(Link, metaclass=NodeMeta):
+class Turbine(Link, Loadable, metaclass=NodeMeta):
+
+    __parameter_attributes__ = ("cost", "min_flow")
+
     def __init__(self, model, name, **kwargs):
         hp_recorder_kwarg_names = ('efficiency', 'density', 'flow_unit_conversion', 'energy_unit_conversion')
         hp_kwargs = {}
@@ -354,5 +355,4 @@ class Turbine(Link, metaclass=NodeMeta):
         node.cost = cost
         node.min_flow = min_flow
 
-        #breakpoint()
         return node
