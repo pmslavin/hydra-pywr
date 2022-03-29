@@ -19,7 +19,8 @@ from hydra_pywr_common.lib.writers import(
     PywrHydraWriter,
     PywrHydraIntegratedWriter,
     PywrIntegratedJsonWriter,
-    IntegratedOutputWriter
+    IntegratedOutputWriter,
+    NetworkTool
 )
 
 from hydra_pywr_common.lib.runners import(
@@ -272,6 +273,46 @@ def run_integrated_file(obj, filename, output_frequency, solver, check_model):
     imr.run_subprocess()
     return 0
 
+
+@cli.command(name="merge-networks", context_settings=dict(
+    ignore_unknown_options=True,
+    allow_extra_args=True))
+@click.pass_obj
+@click.option('-s', '--scenario', type=int, multiple=True)
+@click.option('-p', '--project', type=int, default=None)
+@click.option('-u', '--user-id', type=int, default=None)
+def merge_networks(obj, scenario, project, user_id):
+    client = get_logged_in_client(obj, user_id=user_id)
+    nt = NetworkTool()
+    nt.merge_networks(client, scenario, project)
+    return 0
+
+
+@cli.command(name="merge-multi", context_settings=dict(
+    ignore_unknown_options=True,
+    allow_extra_args=True))
+@click.pass_obj
+@click.option('-s', '--scenario', type=int, multiple=True)
+@click.option('-p', '--project', type=int, default=None)
+@click.option('-w', '--water-template-id', type=int, default=None)
+@click.option('-e', '--energy-template-id', type=int, default=None)
+@click.option('-u', '--user-id', type=int, default=None)
+def merge_multi(obj, scenario, project, water_template_id, energy_template_id, user_id):
+    client = get_logged_in_client(obj, user_id=user_id)
+    template_map = {
+        water_template_id: [],
+        energy_template_id: []
+    }
+    for scenario_id in scenario:
+        exporter = PywrHydraExporter.from_scenario_id(client, scenario_id)
+        data = exporter.get_pywr_data()
+        pnet = PywrNetwork(data)
+        template_map[exporter.template["id"]].append(pnet)
+
+    nt = NetworkTool()
+    nt.merge_multi(client, template_map, project, water_template_id, energy_template_id)
+    #nt.merge_networks(client, scenario, project)
+    return 0
 
 @hydra_app(category='model', name='Run Pywr')
 @cli.command(context_settings=dict(
