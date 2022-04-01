@@ -299,20 +299,48 @@ def merge_networks(obj, scenario, project, user_id):
 @click.option('-u', '--user-id', type=int, default=None)
 def merge_multi(obj, scenario, project, water_template_id, energy_template_id, user_id):
     client = get_logged_in_client(obj, user_id=user_id)
+
     template_map = {
         water_template_id: [],
         energy_template_id: []
     }
+
     for scenario_id in scenario:
         exporter = PywrHydraExporter.from_scenario_id(client, scenario_id)
         data = exporter.get_pywr_data()
         pnet = PywrNetwork(data)
-        template_map[exporter.template["id"]].append(pnet)
+        template_id = exporter.template["id"]
+        template_map[template_id].append({"scenario_id": scenario_id, "network": pnet})
 
     nt = NetworkTool()
-    nt.merge_multi(client, template_map, project, water_template_id, energy_template_id)
-    #nt.merge_networks(client, scenario, project)
+    nt.merge_multi(client, template_map, project)
+
     return 0
+
+
+@cli.command(name="export-multi", context_settings=dict(
+    ignore_unknown_options=True,
+    allow_extra_args=True))
+@click.pass_obj
+@click.option('-s', '--scenario-id', type=int)
+@click.option('-n', '--network-id', type=int)
+@click.option('-u', '--user-id', type=int, default=None)
+def export_multi(obj, scenario_id, network_id, user_id):
+    client = get_logged_in_client(obj, user_id=user_id)
+
+    """
+    exporter = PywrHydraExporter.from_scenario_id(client, scenario_id)
+    data = exporter.get_pywr_data()
+    pnet = PywrNetwork(data)
+
+    nt = NetworkTool()
+    nt.export_multi(client, scenario_id, pnet)
+    """
+    nt = NetworkTool()
+    nt.export_multi(client, scenario_id, network_id)
+
+    return 0
+
 
 @hydra_app(category='model', name='Run Pywr')
 @cli.command(context_settings=dict(
