@@ -5,7 +5,9 @@ from hydra_pywr_common.types.nodes import(
     PywrNode
 )
 from hydra_pywr_common.types.base import(
-    PywrEdge
+    PywrEdge,
+    PywrParameter,
+    PywrRecorder
 )
 
 from hydra_pywr_common.types.fragments.network import(
@@ -85,16 +87,50 @@ class PywrHydraExporter():
 
         return cls(client, network, scenario_id, attributes, template, **kwargs)
 
+    def write_rules(self):
+        filename = "hydra_pywr_custom_module.py"
+
+        prelude = (
+            "from pywr import recorders",
+            "from pywr import parameters",
+            "import pandas",
+            "import numpy as np",
+            "import scipy",
+            "from pywr.nodes import *",
+            "from pywr.parameters.control_curves import *",
+            "from pywr.parameters._thresholds import *",
+            "from pywr.parameters._hydropower import *",
+            "from pywr.domains.river import *"
+        )
+
+        forbidden = ("import", "eval", "exec")
+
+        with open(filename, 'w') as fp:
+            for p in prelude:
+                fp.write(f"{p}\n")
+            fp.write("\n")
+            for rule in self.data.rules:
+                for forbid in forbidden:
+                    if forbid in rule["value"]:
+                        raise PermissionError(f"Use of {forbid} statement forbidden in custom rules.")
+                fp.write(rule["value"])
+                fp.write("\n\n")
+
 
     def get_pywr_data(self, domain=None):
         self.generate_pywr_nodes()
         self.edges = self.build_edges()
+        parameters, recorders = self.build_parameters_recorders()
+
+        self.parameters.update(parameters)
+        self.recorders.update(recorders)
 
         if domain:
             self.timestepper, self.metadata, self.scenarios = self.build_integrated_network_attrs(domain)
         else:
             self.timestepper, self.metadata, self.tables = self.build_network_attrs()
 
+        self.write_rules()
         return self
 
 
@@ -151,7 +187,7 @@ class PywrHydraExporter():
             real_template_id = node["types"][0]["template_id"]
             for node_type in node["types"]:
                 try:
-                    log.info(f"====\nnode: {node}")
+                    #log.info(f"====\nnode: {node}")
                     if real_template_id != self.template["id"]:
                         continue
                     pywr_node_type = self.type_id_map[node_type['id']]['name']
@@ -161,7 +197,7 @@ class PywrHydraExporter():
                     pywr_node_type = None
                     continue
 
-            log.info(f"Found node type {pywr_node_type} for node {node['name']} with nt_id {node_type['id']} on template {self.template['id']}\n====")
+            #log.info(f"Found node type {pywr_node_type} for node {node['name']} with nt_id {node_type['id']} on template {self.template['id']}\n====")
 
             #if pywr_node_type is None:
             #    raise ValueError('Template does not contain node of type "{}".'.format(pywr_node_type))
@@ -169,8 +205,44 @@ class PywrHydraExporter():
 
             # Skip as not in this template...
             if pywr_node_type:
-                log.info(f"Building node {node['name']} as {pywr_node_type}...")
+                #log.info(f"Building node {node['name']} as {pywr_node_type}...")
                 self.build_node_and_references(node, pywr_node_type)
+
+    def get_dataset_by_attr_id(self, attr_id):
+        # d = data.scenarios[0].resourcescenarios[x]
+        # d.resource_attr_id == attr_id
+        # d.dataset
+
+        scenario = self.data.scenarios[0]
+        for rs in scenario.resourcescenarios:
+            if rs.resource_attr_id == attr_id:
+                return rs.dataset
+
+
+    def build_parameters_recorders(self):
+        # attr_id = data.network.attributes[x].id
+        parameters = {} # {name: P()}
+        recorders = {} # {name: R()}
+
+        for attr in self.data.attributes:
+            ds = self.get_dataset_by_attr_id(attr.id)
+            if not ds:
+                continue
+            if not ds["type"].startswith(("PYWR_PARAMETER", "PYWR_RECORDER")):
+                continue
+            if ds["type"].startswith("PYWR_PARAMETER"):
+                value = json.loads(ds["value"])
+                p = PywrParameter.ParameterFactory((ds["name"], value))
+                parameters[p.name] = p
+            elif ds["type"].startswith("PYWR_RECORDER"):
+                value = json.loads(ds["value"])
+                try:
+                    r = PywrRecorder.RecorderFactory((ds["name"], value))
+                except:
+                    breakpoint()
+                recorders[r.name] = r
+
+        return parameters, recorders
 
 
     def build_node_and_references(self, nodedata, pywr_node_type):
@@ -204,11 +276,11 @@ class PywrHydraExporter():
         if "description" in nodedata:
             node_attr_data["comment"] = nodedata.get("description")
 
-        dev_node = PywrNode.NodeFactory(node_attr_data)
+        node = PywrNode.NodeFactory(node_attr_data)
 
-        self.nodes[dev_node.name] = dev_node
-        self.parameters.update(dev_node.parameters)
-        self.recorders.update(dev_node.recorders)
+        self.nodes[node.name] = node
+        self.parameters.update(node.parameters)
+        #self.recorders.update(node.recorders)
 
 
     def build_edges(self):
