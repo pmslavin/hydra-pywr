@@ -18,6 +18,7 @@ from hydra_pywr_common.lib.writers import(
     PywrJsonWriter,
     PywrHydraWriter,
     NewPywrHydraWriter,
+    HydraToPywrNetwork,
     PywrHydraIntegratedWriter,
     PywrIntegratedJsonWriter,
     IntegratedOutputWriter,
@@ -104,9 +105,8 @@ def import_json(obj, filename, project_id, user_id, template_id, projection, run
 @click.option('--projection', type=str, default=None)
 @click.option('--run/--no-run', default=False)
 @click.option('--solver', type=str, default=None)
-@click.option('--check-model/--no-check-model', default=True)
 @click.option('--ignore-type-errors', is_flag=True, default=False)
-def new_import_json(obj, filename, project_id, user_id, template_id, projection, run, solver, check_model, ignore_type_errors, *args):
+def new_import_json(obj, filename, project_id, user_id, template_id, projection, run, solver, ignore_type_errors, *args):
     """ Import a Pywr JSON file into Hydra. """
     click.echo(f'Beginning import of "{filename}" to Project ID: {project_id}')
 
@@ -119,12 +119,43 @@ def new_import_json(obj, filename, project_id, user_id, template_id, projection,
     if template_id is None:
         raise Exception("No template specified")
 
-    from pywrparser.types import PywrNetwork as NewPywrNetwork
+    from pywrparser.types.network import PywrNetwork as NewPywrNetwork
 
     pnet, errors = NewPywrNetwork.from_file(filename)
     hwriter = NewPywrHydraWriter(pnet, user_id=user_id, template_id=template_id, project_id=project_id)
     hwriter.build_hydra_network(projection)
     hwriter.add_network_to_hydra()
+
+@hydra_app(category='export', name='Export to Pywr JSON')
+@cli.command(name='new-export', context_settings=dict(
+    ignore_unknown_options=True,
+    allow_extra_args=True))
+@click.pass_obj
+@click.option('--data-dir', default='/tmp')
+@click.option('-s', '--scenario-id', type=int, default=None)
+@click.option('-u', '--user-id', type=int, default=None)
+@click.option('--json-indent', type=int, default=2)
+@click.option('--json-sort-keys/--no-json-sort-keys', default=False)
+def new_export_json(obj, data_dir, scenario_id, user_id, json_sort_keys, json_indent):
+    """ Export a Pywr JSON from Hydra. """
+    client = get_logged_in_client(obj, user_id=user_id)
+
+    scenario = client.get_scenario(scenario_id, include_data=True, include_results=False, include_metadata=False, include_attr=False)
+    network = client.get_network(scenario.network_id, include_data=True, include_results=False, template_id=None)
+    network.scenarios = [scenario]
+    network.rules = client.get_resource_rules('NETWORK', scenario.network_id)
+
+    attributes = client.get_attributes()
+    attributes = {attr.id: attr for attr in attributes}
+
+    index = 0
+
+    print(f"Retreiving template {network.types[index].template_id}")
+    template = client.get_template(network.types[index].template_id)
+
+    exporter = HydraToPywrNetwork(client, network, scenario_id, attributes, template)
+    pywr_network = exporter.build_pywr_network()
+    breakpoint()
 
 
 @hydra_app(category='import', name='Import Integrate Pynsim JSON from combined file')
