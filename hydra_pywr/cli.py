@@ -138,6 +138,8 @@ def new_import_json(obj, filename, project_id, user_id, template_id, projection,
 @click.option('--json-sort-keys/--no-json-sort-keys', default=False)
 def new_export_json(obj, data_dir, scenario_id, user_id, json_sort_keys, json_indent):
     """ Export a Pywr JSON from Hydra. """
+    from pywrparser.types.network import PywrNetwork as NewPywrNetwork
+
     client = get_logged_in_client(obj, user_id=user_id)
 
     scenario = client.get_scenario(scenario_id, include_data=True, include_results=False, include_metadata=False, include_attr=False)
@@ -150,12 +152,22 @@ def new_export_json(obj, data_dir, scenario_id, user_id, json_sort_keys, json_in
 
     index = 0
 
-    print(f"Retreiving template {network.types[index].template_id}")
+    click.echo(f"Retreiving template {network.types[index].template_id}")
     template = client.get_template(network.types[index].template_id)
 
     exporter = HydraToPywrNetwork(client, network, scenario_id, attributes, template)
-    pywr_network = exporter.build_pywr_network()
-    breakpoint()
+    network_data = exporter.build_pywr_network()
+    """ Calls ctor directly without factory; network_data acts as 'parser' inst """
+    pywr_network = NewPywrNetwork(network_data)
+
+    pywr_network.detach_parameters()
+
+    pnet_title = pywr_network.metadata.data["title"]
+    outfile = os.path.join(data_dir, f"{pnet_title.replace(' ', '_')}.json")
+    with open(outfile, mode='w') as fp:
+        json.dump(pywr_network.as_dict(), fp, sort_keys=json_sort_keys, indent=2)
+
+    click.echo(f"Network: {scenario.network_id}, Scenario: {scenario_id} exported to `{outfile}`")
 
 
 @hydra_app(category='import', name='Import Integrate Pynsim JSON from combined file')
