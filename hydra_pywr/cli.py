@@ -9,6 +9,9 @@ from . import utils
 from hydra_client.click import hydra_app, make_plugins, write_plugins
 import pandas
 
+from pywrparser.types.network import PywrNetwork as NewPywrNetwork
+from pywrparser.lib import PywrJSONEncoder
+
 from hydra_pywr_common.types.network import(
     PywrNetwork,
     PywrIntegratedNetwork
@@ -119,9 +122,14 @@ def new_import_json(obj, filename, project_id, user_id, template_id, projection,
     if template_id is None:
         raise Exception("No template specified")
 
-    from pywrparser.types.network import PywrNetwork as NewPywrNetwork
 
     pnet, errors = NewPywrNetwork.from_file(filename)
+    if errors:
+        for component, errs in errors.items():
+            for err in errs:
+                print(err)
+        exit(1)
+
     hwriter = NewPywrHydraWriter(pnet, user_id=user_id, template_id=template_id, project_id=project_id)
     hwriter.build_hydra_network(projection)
     hwriter.add_network_to_hydra()
@@ -160,12 +168,12 @@ def new_export_json(obj, data_dir, scenario_id, user_id, json_sort_keys, json_in
     """ Calls ctor directly without factory; network_data acts as 'parser' inst """
     pywr_network = NewPywrNetwork(network_data)
 
-    pywr_network.detach_parameters()
+    pywr_network.attach_parameters()
 
     pnet_title = pywr_network.metadata.data["title"]
     outfile = os.path.join(data_dir, f"{pnet_title.replace(' ', '_')}.json")
     with open(outfile, mode='w') as fp:
-        json.dump(pywr_network.as_dict(), fp, sort_keys=json_sort_keys, indent=2)
+        json.dump(pywr_network.as_dict(), fp, sort_keys=json_sort_keys, indent=2, cls=PywrJSONEncoder)
 
     click.echo(f"Network: {scenario.network_id}, Scenario: {scenario_id} exported to `{outfile}`")
 
@@ -384,9 +392,10 @@ def merge_multi(obj, scenario, project, water_template_id, energy_template_id, u
     }
 
     for scenario_id in scenario:
-        exporter = PywrHydraExporter.from_scenario_id(client, scenario_id)
-        data = exporter.get_pywr_data()
-        pnet = PywrNetwork(data)
+        #exporter = PywrHydraExporter.from_scenario_id(client, scenario_id)
+        exporter = HydraToPywrNetwork.from_scenario_id(client, scenario_id)
+        data = exporter.build_pywr_network()
+        pnet = NewPywrNetwork(data)
         template_id = exporter.template["id"]
         template_map[template_id].append({"scenario_id": scenario_id, "network": pnet})
 
