@@ -10,7 +10,7 @@ from hydra_client.click import hydra_app, make_plugins, write_plugins
 import pandas
 
 from pywrparser.types.network import PywrNetwork as NewPywrNetwork
-from pywrparser.lib import PywrJSONEncoder
+from pywrparser.lib import PywrTypeJSONEncoder
 
 from hydra_pywr_common.types.network import(
     PywrNetwork,
@@ -123,7 +123,12 @@ def new_import_json(obj, filename, project_id, user_id, template_id, projection,
         raise Exception("No template specified")
 
 
-    pnet, errors = NewPywrNetwork.from_file(filename)
+    pnet, errors, warnings = NewPywrNetwork.from_file(filename)
+    if warnings:
+        for component, warns in warnings.items():
+            for warn in warns:
+                print(warn)
+
     if errors:
         for component, errs in errors.items():
             for err in errs:
@@ -169,11 +174,12 @@ def new_export_json(obj, data_dir, scenario_id, user_id, json_sort_keys, json_in
     pywr_network = NewPywrNetwork(network_data)
 
     pywr_network.attach_parameters()
+    pywr_network.detach_parameters()
 
     pnet_title = pywr_network.metadata.data["title"]
     outfile = os.path.join(data_dir, f"{pnet_title.replace(' ', '_')}.json")
     with open(outfile, mode='w') as fp:
-        json.dump(pywr_network.as_dict(), fp, sort_keys=json_sort_keys, indent=2, cls=PywrJSONEncoder)
+        json.dump(pywr_network.as_dict(), fp, sort_keys=json_sort_keys, indent=2, cls=PywrTypeJSONEncoder)
 
     click.echo(f"Network: {scenario.network_id}, Scenario: {scenario_id} exported to `{outfile}`")
 
