@@ -30,6 +30,7 @@ from hydra_pywr_common.lib.writers import(
 
 from hydra_pywr_common.lib.runners import(
     IntegratedModelRunner,
+    MultiNetworkRunner,
     write_output
 )
 
@@ -311,6 +312,42 @@ def integrated_run(ctx, scenario_id, user_id, output_frequency, solver, check_mo
         write_output(f"Importing results for {engine} engine from {h5output} and {h5metrics}...")
         template_id = dests[engine]["template_id"]
         iow = IntegratedOutputWriter(scenario_id, template_id, h5output, h5metrics, engine, user_id=user_id)
+        iow.build_hydra_output()
+
+
+@hydra_app(category='model', name='Run Multi-Network Model')
+@cli.command(name="multi-run", context_settings=dict(
+    ignore_unknown_options=True,
+    allow_extra_args=True))
+@click.pass_context
+@click.option('-s', '--scenario-id', type=int, default=None)
+@click.option('-n', '--network-id', type=int, default=None)
+@click.option('-w', '--water-template-id', type=int, default=None)
+@click.option('-e', '--energy-template-id', type=int, default=None)
+@click.option('-u', '--user-id', type=int, default=None)
+@click.option('--data-dir', default=None)
+def multi_run(ctx, scenario_id, user_id, water_template_id, energy_template_id, data_dir):
+    ctx.invoke(export_multi, scenario_id=scenario_id, network_id=network_id, user_id=user_id)
+
+    multiconfig = "multiconfig.json"
+    cmdbin = "EAPP-water-energy"
+    mr = MultiNetworkRunner(multiconfig)
+    mr.run_subprocess(cmdbin)
+
+    with open(multiconfig, 'r') as fp:
+        configsrc = json.load(fp)
+
+    engine_template_map = {}
+    for engine in configsrc["engines"]:
+        solver = engine["kwargs"].get("solver")
+        engine_template = water_template_id if not solver else energy_template_id
+        engine_template_map[engine["name"]] = engine_template
+
+    for engine_name, template_id in engine_template_map.items():
+        h5output = f"{engine_name}_Outputs.h5"
+        h5metrics = f"{engine_name}_Metrics.h5"
+        write_output(f"Importing results for {engine_name} engine from {h5output} and {h5metrics}...")
+        iow = IntegratedOutputWriter(scenario_id, template_id, h5output, h5metrics, engine_name, user_id=user_id)
         iow.build_hydra_output()
 
 
