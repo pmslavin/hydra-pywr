@@ -25,7 +25,8 @@ from hydra_pywr_common.lib.writers import(
     PywrHydraIntegratedWriter,
     PywrIntegratedJsonWriter,
     IntegratedOutputWriter,
-    NetworkTool
+    NetworkTool,
+    MultiOutputWriter
 )
 
 from hydra_pywr_common.lib.runners import(
@@ -326,13 +327,13 @@ def integrated_run(ctx, scenario_id, user_id, output_frequency, solver, check_mo
 @click.option('-e', '--energy-template-id', type=int, default=None)
 @click.option('-u', '--user-id', type=int, default=None)
 @click.option('--data-dir', default=None)
-def multi_run(ctx, scenario_id, user_id, water_template_id, energy_template_id, data_dir):
-    ctx.invoke(export_multi, scenario_id=scenario_id, network_id=network_id, user_id=user_id)
+def multi_run(ctx, scenario_id, network_id, user_id, water_template_id, energy_template_id, data_dir):
+    #ctx.invoke(export_multi, scenario_id=scenario_id, network_id=network_id, user_id=user_id)
 
     multiconfig = "multiconfig.json"
     cmdbin = "EAPP-water-energy"
-    mr = MultiNetworkRunner(multiconfig)
-    mr.run_subprocess(cmdbin)
+    #mr = MultiNetworkRunner(multiconfig)
+    #mr.run_subprocess(cmdbin)
 
     with open(multiconfig, 'r') as fp:
         configsrc = json.load(fp)
@@ -343,12 +344,15 @@ def multi_run(ctx, scenario_id, user_id, water_template_id, energy_template_id, 
         engine_template = water_template_id if not solver else energy_template_id
         engine_template_map[engine["name"]] = engine_template
 
+    print(f"{engine_template_map=}")
+
     for engine_name, template_id in engine_template_map.items():
-        h5output = f"{engine_name}_Outputs.h5"
+        #h5output = f"{engine_name}_Outputs.h5"
         h5metrics = f"{engine_name}_Metrics.h5"
-        write_output(f"Importing results for {engine_name} engine from {h5output} and {h5metrics}...")
-        iow = IntegratedOutputWriter(scenario_id, template_id, h5output, h5metrics, engine_name, user_id=user_id)
-        iow.build_hydra_output()
+        domain = "water" if template_id == water_template_id else "energy"
+        write_output(f"Importing results for {engine_name} engine from {h5metrics}...")
+        mow = MultiOutputWriter(scenario_id, template_id, engine_name, h5metrics, domain, user_id=user_id)
+        mow.build_hydra_output()
 
 
 @cli.command(name="combine-integrated-inputs")
