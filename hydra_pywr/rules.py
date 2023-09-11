@@ -11,8 +11,6 @@ import pandas
 import numpy as np
 import scipy
 
-import marshmallow
-
 from pywr.parameters import *
 from pywr.recorders import *
 
@@ -20,14 +18,13 @@ from pywr.nodes import *
 from pywr.parameters.control_curves import *
 from pywr.parameters._thresholds import *
 from pywr.parameters._hydropower import *
-from pywr.schema import *
 from pywr.domains.river import *
 
 #In case use wants to namespace stuff by parameters/recorders, the recommended way.
 from pywr import recorders
 from pywr import parameters
 
-from .nodes import DataFrameField
+import hydra_pywr
 
 LOG = logging.getLogger('hydra_pywr')
 
@@ -42,7 +39,6 @@ LOG = logging.getLogger('hydra_pywr')
 """
 
 
-
 def exec_rules(rules):
     for rule in rules:
         LOG.info("Executing rule %s", rule.name)
@@ -55,3 +51,9 @@ def exec_rules(rules):
         except Exception as e:
             LOG.exception(e)
             LOG.critical("Unable to execute rule %s. Error was: %s", rule.name, e)
+
+    #Now find any classes that have been added, and add them to the module's
+    #dict so they can be accessed by pywr
+    for k, v in locals().items():
+        if isinstance(v, type):
+            hydra_pywr.rules.__dict__[k] = v
