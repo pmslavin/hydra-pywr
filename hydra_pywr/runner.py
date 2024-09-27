@@ -1,5 +1,12 @@
+import hmac
 import pandas
 import yaml
+import tempfile
+import os
+import logging
+import json
+import hashlib
+from urllib.parse import urlparse
 
 from pywr.model import Model
 from pywr.nodes import Node, Storage
@@ -7,19 +14,94 @@ from pywr.parameters import Parameter, DeficitParameter
 from pywr.recorders import NumpyArrayNodeRecorder, NumpyArrayStorageRecorder, NumpyArrayParameterRecorder
 from pywr.recorders.progress import ProgressRecorder
 
+from pywrparser.lib import PywrTypeJSONEncoder
+from pywrparser.utils import parse_reference_key
+from random import randbytes
+
 from .exporter import HydraToPywrNetwork
 
 from pywrparser.types.network import PywrNetwork
 from hydra_pywr.nodes import *
+from . import utils
 
-import os
-import logging
 log = logging.getLogger(__name__)
 
 domain_solvers = {
     "water": "glpk-edge",
     "energy": "glpk-dcopf"
 }
+
+def run_file(filename, domain, output_file):
+    pfr = PywrFileRunner(domain)
+    pfr.load_pywr_model_from_file(filename)
+    pfr.run_pywr_model(output_file)
+
+def run_network_scenario(client, scenario_id, template_id, domain,
+                         output_frequency=None, solver=None, data_dir='/tmp'):
+
+    runner = PywrHydraRunner.from_scenario_id(client, scenario_id,
+                                             template_id=template_id)
+
+    network_data = runner.build_pywr_network()
+    pywr_network = PywrNetwork(network_data)
+    pywr_network.promote_inline_parameters()
+    pywr_network.detach_parameters()
+
+    url_refs = pywr_network.url_references()
+    for url, refs in url_refs.items():
+        u = urlparse(url)
+        filedest = None
+        if u.scheme == "s3":
+            filedest = utils.retrieve_s3(url, data_dir)
+        elif u.scheme.startswith("http"):
+            filedest = utils.retrieve_url(url, data_dir)
+        else:
+            #'/file.csv' -> ('', file.csv)
+            spliturl = url.strip(os.sep).split(os.sep)
+            #If the url is 'file.csv'
+            if len(spliturl) == 1:
+
+                full_path = runner.filedict.get(spliturl[0])
+                if full_path is not None:
+                    filedest = utils.retrieve_s3(full_path, data_dir)
+        if filedest is not None:
+            for ref in refs:
+                ref.data["url"] = filedest
+
+    if data_dir is not None:
+        save_pywr_file(pywr_network.as_dict(), data_dir, network_data.data['id'], scenario_id)
+
+    pywr_data = runner.load_pywr_model(pywr_network, solver=solver)
+
+    network_id = runner.data.id
+
+    runner.run_pywr_model()
+    runner.save_pywr_results()
+
+    log.info(f'Pywr model run success. Network ID: {network_id}, Scenario ID: {scenario_id}')
+
+
+def save_pywr_file(data, data_dir, network_id=None, scenario_id=None):
+    """
+    Save pywr json data to the specified directory
+    """
+    if data_dir is None:
+        log.info("No data dir specified. Returning.")
+        exit(1)
+
+    title = data['metadata']['title']
+
+    #check if the output folder exists and create it if not
+    if not os.path.isdir(data_dir):
+        #exist_ok sets unix the '-p' functionality to create the whole path
+        os.makedirs(data_dir, exist_ok=True)
+
+    filename = os.path.join(data_dir, f'{title}.json')
+    with open(filename, mode='w') as fh:
+        json.dump(data, fh, sort_keys=True, indent=2)
+
+    log.info(f'Successfully exported "{filename}". Network ID: {network_id}, Scenario ID: {scenario_id}')
+
 
 class PywrFileRunner():
     def __init__(self, domain="water"):
@@ -30,6 +112,10 @@ class PywrFileRunner():
     def load_pywr_model_from_file(self, filename, solver=None):
         if self.domain == "energy":
             from pywr_dcopf import core
+        try:
+            from . import hydra_pywr_custom_module
+        except (ModuleNotFoundError, ImportError) as e:
+            pass
 
         pnet, errors, warnings = PywrNetwork.from_file(filename)
         if warnings:
@@ -68,7 +154,6 @@ class PywrFileRunner():
         df = model.to_dataframe()
         df.to_csv(outfile)
 
-
 class PywrHydraRunner(HydraToPywrNetwork):
     """ An extension of `HydraToPywrNetwork` that adds methods for running a Pywr model. """
 
@@ -82,9 +167,27 @@ class PywrHydraRunner(HydraToPywrNetwork):
 
         self.attr_dimension_map = {}
 
+        self.node_lookup = {}
+        self.node_attr_lookup = {}
+        for n in self.data['nodes']:
+            self.node_lookup[n.name] = n
+            self.node_attr_lookup[n.name] = {}
+            for a in n['attributes']:
+                self.node_attr_lookup[a.attr_id] = a
+
         self.attr_name_map = self.make_attr_name_map()
 
         self.make_attr_unit_map()
+
+        self.limit_nodes_recording = False
+
+        tmpdir = tempfile.gettempdir()
+        self.results_location = os.getenv("PYWR_RESULTS_LOCATION", tmpdir)
+        self.bucket_name = os.getenv("PYWR_RESULTS_S3_BUCKET", 'pywr-results')
+        hashkey = hashlib.sha256(randbytes(56)).hexdigest()
+        self.s3_path = hmac.digest(hashkey, str(self.scenario_id).encode('utf-8'), "sha-256")
+
+        self.resultstores = {}
 
     def _copy_scenario(self):
         # Now construct a scenario object
@@ -117,15 +220,54 @@ class PywrHydraRunner(HydraToPywrNetwork):
         if self.domain == "energy":
             from pywr_dcopf import core
 
-        solver = domain_solvers[self.domain]
+        try:
+            from . import hydra_pywr_custom_module
+        except (ModuleNotFoundError, ImportError) as e:
+            pass
+            
+        if solver is None:
+            solver = domain_solvers[self.domain]
 
         #data = self.build_pywr_network()
         #pnet = PywrNetwork(data)
         pywr_data = pywr_network.as_json()
+
         model = Model.loads(pywr_data, solver=solver)
+
+        tmp = tempfile.gettempdir()
+
+        file_location = os.path.join(tmp, f"pywrmodel_n_{self.data['id']}_s_{self.data['scenarios'][0]['id']}.json")
+
+        with open(file_location, 'w') as f:
+            json.dump(pywr_network.as_dict(), f, sort_keys=True, indent=4)
+            log.info("File written to %s", file_location)
+
         self.model = model
 
         return pywr_data
+
+    def get_nodes_to_record(self):
+        """
+        Get the nodes to record in the network.
+        """
+        try:
+            node_recorder_attribute = self._get_attribute_from_name('record_nodes')
+        except (KeyError, ValueError):
+            return []
+
+        for network_ra in self.data['attributes']:
+            if network_ra['attr_id'] == node_recorder_attribute['id']:
+                rs = list(filter(lambda x:x.resource_attr_id==network_ra['id'],
+                                 self.data.scenarios[0].resourcescenarios))
+                if len(rs) > 0:
+                    try:
+                        value = json.loads(rs[0]['dataset']['value'])
+                        if len(value) > 0:
+                            self.limit_nodes_recording = True
+                    except:
+                        self.log.critical(f"Unable to read which nodes to record. Value should be an array of node names or IDS. The value is: {rs[0]['dataset']['value']}")
+                        return []
+                return []
 
 
     def run_pywr_model(self, domain="water"):
@@ -155,7 +297,8 @@ class PywrHydraRunner(HydraToPywrNetwork):
         for recorder in model.recorders:
             if hasattr(recorder, 'to_dataframe'):
                 df_recorders.append(recorder)
-            elif hasattr(recorder, "value"):
+
+            if hasattr(recorder, "value") or hasattr(recorder, "values"):
                 non_df_recorders.append(recorder)
 
         # Force a setup regardless of whether the model has been run or setup before
@@ -174,6 +317,21 @@ class PywrHydraRunner(HydraToPywrNetwork):
         self._df_recorders = df_recorders
         self._non_df_recorders = non_df_recorders
 
+        log.info(run_stats)
+
+    def save_results_to_s3(self):
+        """
+            upload the h5 file results to s3
+        """
+        resultfiles = list(self.resultstores.keys())
+        for f in os.listdir(self.results_location):
+            if f not in resultfiles:
+                continue
+            log.info("Saving %s to bucket %s s3", f, self.bucket_name)
+            import boto3    
+            s3 = boto3.client('s3')
+            s3.upload_file(os.path.join(self.results_location, f), Bucket=self.bucket_name, Key=f"{self.s3_path}/{f}")
+            log.info("%s saved to s3 bucket %s", f, self.bucket_name)
 
     def get_do_config(self):
         do_config_prefix = "do_"
@@ -198,17 +356,14 @@ class PywrHydraRunner(HydraToPywrNetwork):
         attribute = self._get_attribute_from_name(attribute_name)
         attribute_id = attribute['id']
 
-        for node in self.data['nodes']:
-
-            if node['name'] == node_name:
-                resource_attributes = node['attributes']
-                break
+        node = self.node_lookup.get(node_name)
+        if node is not None:
+            resource_attributes = node['attributes']
         else:
             raise ValueError('Node name "{}" not found in network data.'.format(node_name))
-
-        for resource_attribute in resource_attributes:
-            if resource_attribute['attr_id'] == attribute_id:
-                return resource_attribute['id']
+        node_attribute = self.node_attr_lookup[node.name].get(attribute_id)
+        if node_attribute is not None:
+            return node_attribute['id']
         else:
             raise ValueError('No resource attribute for node "{}" and attribute "{}" found.'.format(node_name, attribute))
 
@@ -236,7 +391,10 @@ class PywrHydraRunner(HydraToPywrNetwork):
             try:
                 node = recorder.node
             except AttributeError:
-                node = recorder.parameter.node
+                try:
+                    node = recorder.parameter.node
+                except AttributeError:
+                    return None
         return node
 
     def _get_attribute_name_from_recorder(self, recorder, is_dataframe=False):
@@ -256,12 +414,15 @@ class PywrHydraRunner(HydraToPywrNetwork):
         if not attribute_name.startswith(simulated_prefix):
             attribute_name = f'{simulated_prefix}_{attribute_name}'
 
-        if not (is_dataframe or attribute_name.endswith(scalar_suffix)):
+        if is_dataframe is False and not attribute_name.endswith(scalar_suffix):
             attribute_name = f"{attribute_name}_{scalar_suffix}"
 
         return attribute_name
 
     def _add_node_flagged_recorders(self, model):
+
+        nodes_to_record = self.get_nodes_to_record()
+
         if self.domain == "energy":
             from pywr_dcopf.core import Generator, Load, Line, Battery
             node_classes = (Node, Generator, Load, Line, Battery)
@@ -269,6 +430,9 @@ class PywrHydraRunner(HydraToPywrNetwork):
             node_classes = (Node,)
 
         for node in model.nodes:
+            if self.limit_nodes_recording is True and node.name not in nodes_to_record:
+                continue
+
             try:
                 flags = self._node_recorder_flags[node.name]
             except KeyError:
@@ -337,6 +501,9 @@ class PywrHydraRunner(HydraToPywrNetwork):
 
     def save_pywr_results(self):
         """ Save the outputs from a Pywr model run to Hydra. """
+
+
+
         # Ensure all the results from previous run are removed.
         self._delete_resource_scenarios()
 
@@ -348,7 +515,7 @@ class PywrHydraRunner(HydraToPywrNetwork):
         # First add any new attributes required
         attribute_names = []
         for recorder in self._df_recorders:
-            attribute_names.append(self._get_attribute_name_from_recorder(recorder))
+            attribute_names.append(self._get_attribute_name_from_recorder(recorder, is_dataframe=True))
         for recorder in self._non_df_recorders:
             attribute_names.append(self._get_attribute_name_from_recorder(recorder))
 
@@ -358,6 +525,7 @@ class PywrHydraRunner(HydraToPywrNetwork):
             attributes.append({
                 'name': attribute_name,
                 'description': '',
+                'project_id': self.data.project_id,
                 'dimension_id' : self.attr_dimension_map.get(attribute_name)
             })
 
@@ -369,13 +537,111 @@ class PywrHydraRunner(HydraToPywrNetwork):
         for resource_scenario in self.generate_array_recorder_resource_scenarios():
             scenario['resourcescenarios'].append(resource_scenario)
 
-        self.hydra.update_scenario(scenario)
+        chunk = 100
+        i = 0
+        while i < len(scenario['resourcescenarios']):
+            data = scenario['resourcescenarios'][i:i+chunk]
+            log.info('Saving %s datasets', chunk)
+            self.hydra.bulk_update_resourcedata(
+                scenario_ids = [scenario['id']],
+                resource_scenarios = data)
+            i = i+chunk+1
+
+        #flush the results to the h5 file
+        for resultstore in self.resultstores.values():
+            resultstore.close()
+
+        log.info("Results stored to: %s", self.results_location)
+
+        self.save_results_to_s3()   
+
+    def add_resource_attributes(self, recorders, is_dataframe):
+        """
+            Identify new resource attribtues which need adding to the network, and add them prior to adding the data
+            Return a mapping from the recorder name to the new Resource Attr ID.
+        """
+
+        resource_attributes_to_add = []
+        recorder_ra_map = {}
+        recorder_ra_id_map={}
+
+        for recorder in recorders:
+
+            resource_attribute_id=None
+            resource_type = 'NETWORK'
+            resource_id = self.data['id']
+            attribute_name = self._get_attribute_name_from_recorder(
+                recorder,
+                is_dataframe=is_dataframe
+            )
+            recorder_name = recorder.name
+            if attribute_name.endswith('value'):
+                recorder_name = recorder.name + '_value'
+
+            attribute = self._get_attribute_from_name(attribute_name)
+
+            try:
+                recorder_node = self._get_node_from_recorder(recorder)
+            except AttributeError:
+                recorder_node=None
+
+            if recorder_node is None:
+                for network_ra in self.data['attributes']:
+                    if network_ra['attr_id'] == attribute['id']:
+                        resource_attribute_id = network_ra['id']
+            else:
+                try:
+                    resource_attribute_id = self._get_resource_attribute_id(recorder_node.name,
+                                                                            attribute_name)
+                except ValueError:
+                    if recorder_node is None:
+                        recorder_node_name = recorder.name.split('__:')[0].replace('__', '')
+                    else:
+                        recorder_node_name = recorder_node.name
+
+                    for node in self.data['nodes']:
+                        if node['name'] == recorder_node_name:
+                            resource_id = node['id']
+                            resource_type = 'NODE'
+
+                            break
+                        if recorder_node.parent is not None:
+                            if node['name'] == recorder_node.parent.name:
+                                resource_id = node['id']
+                                resource_type = 'NODE'
+                                break
+
+            if resource_attribute_id is not None:
+                recorder_ra_id_map[recorder_name] = resource_attribute_id
+                continue
+            else:
+
+                # Try to get the resource attribute
+                resource_attributes_to_add.append(dict(resource_type=resource_type,
+                                                                resource_id=resource_id,
+                                                                attr_id=attribute['id'],
+                                                                is_var='Y',
+                                                                error_on_duplicate='N'))
+                recorder_ra_map[(resource_type, resource_id, attribute['id'])] = recorder_name
+
+        if len(resource_attributes_to_add) > 0:
+            new_resource_attributes = self.hydra.add_resource_attributes(resource_attributes=resource_attributes_to_add)
+            for new_ra in new_resource_attributes:
+                recorder_name = recorder_ra_map[(new_ra['ref_key'], new_ra.get('node_id', new_ra.get('network_id')), new_ra['attr_id'])]
+                recorder_ra_id_map[recorder_name] = new_ra['id']
+
+        return recorder_ra_id_map
 
     def generate_array_recorder_resource_scenarios(self):
         """ Generate resource scenario data from NumpyArrayXXX recorders. """
         if self._df_recorders is None:
             log.warning('No array recorders defined, results not saved to Hydra.')
             return
+
+        #get a mapping from recorder names to resource attribute IDs
+        df_recorder_ra_id_map = self.add_resource_attributes(self._df_recorders, is_dataframe=True)
+        non_df_recorder_ra_id_map = self.add_resource_attributes(self._non_df_recorders, is_dataframe=False)
+
 
         for recorder in self._df_recorders:
             df = recorder.to_dataframe()
@@ -399,8 +665,29 @@ class PywrHydraRunner(HydraToPywrNetwork):
                     new_col_names.append(colname.split(':')[1].strip())
                 df.columns = new_col_names
 
+            if "__:" in recorder.name:
+                nodename, attrname = parse_reference_key(recorder.name)
+            else:
+                nodename = "network"
+                attrname = recorder.name
+
+            filename = f'{attrname}.h5'
+            resultstore = self.resultstores.get(filename)
+            if resultstore is None:
+                resultstore = pandas.HDFStore(os.path.join(self.results_location, filename), mode='w')
+                self.resultstores[filename] = resultstore
+
+            resultstore.put(f"{nodename}", df)
+            resultstore[f"{nodename}"].attrs['pandas_type'] = 'frame'
+
             # Convert to JSON for saving in hydra
-            value = df.to_json(date_format='iso', date_unit='s')
+            value = json.dumps({
+                "data":
+                {
+                    "url": f"s3://{self.bucket_name}/{self.s3_path}/{attrname}.h5",
+                    "group": f"{nodename}"
+                }
+            })
 
             #Use this later so we can create sensible labels and metadata
             #for when the data is back in hydra
@@ -410,6 +697,7 @@ class PywrHydraRunner(HydraToPywrNetwork):
 
             resource_scenario = self._make_recorder_resource_scenario(recorder,
                                                                       value,
+                                                                      df_recorder_ra_id_map[recorder.name],
                                                                       'dataframe',
                                                                       is_timeseries=is_timeseries,
                                                                       is_dataframe=True)
@@ -430,17 +718,20 @@ class PywrHydraRunner(HydraToPywrNetwork):
                 if len(value) == 1:
                     value = value[0]
                     data_type = "scalar"
+                value = json.dumps(value)
             except NotImplementedError:
                 continue
             else:
                 try:
-                    value = recorder.value()
-                    data_type = "scalar"
+                    if hasattr(recorder, 'value'):
+                        value = recorder.value()
+                        data_type = "scalar"
                 except NotImplementedError:
                     continue
 
             resource_scenario = self._make_recorder_resource_scenario(recorder,
                                                                       value,
+                                                                      non_df_recorder_ra_id_map[recorder.name+'_value'],
                                                                       data_type,
                                                                       is_dataframe=False)
 
@@ -449,40 +740,11 @@ class PywrHydraRunner(HydraToPywrNetwork):
 
             yield resource_scenario
 
-    def _make_recorder_resource_scenario(self, recorder, value, data_type, is_timeseries=False, is_dataframe=False):
+    def _make_recorder_resource_scenario(self, recorder, value, resource_attribute_id, data_type, is_timeseries=False, is_dataframe=False):
         # Get the attribute and its ID
         attribute_name = self._get_attribute_name_from_recorder(recorder, is_dataframe=is_dataframe)
+
         attribute = self._get_attribute_from_name(attribute_name)
-
-        # Now we need to ensure there is a resource attribute for all nodes and recorder attributes
-
-        try:
-            recorder_node = self._get_node_from_recorder(recorder)
-        except AttributeError:
-            return None
-
-        try:
-            resource_attribute_id = self._get_resource_attribute_id(recorder_node.name,
-                                                                    attribute_name)
-        except ValueError:
-            for node in self.data['nodes']:
-                if node['name'] == recorder_node.name:
-                    node_id = node['id']
-                    break
-                if recorder_node.parent is not None:
-                    if node['name'] == recorder_node.parent.name:
-                        node_id = node['id']
-                        break
-            else:
-                return None
-
-            # Try to get the resource attribute
-            resource_attribute = self.hydra.add_resource_attribute('NODE',
-                                                               node_id,
-                                                               attribute['id'],
-                                                               is_var='Y',
-                                                               error_on_duplicate=False)
-            resource_attribute_id = resource_attribute['id']
 
         unit_id = self.attr_unit_map.get(attribute.id)
 
@@ -492,7 +754,7 @@ class PywrHydraRunner(HydraToPywrNetwork):
             if is_timeseries is True:
                 metadata['xAxisLabel'] = 'Time'
 
-        resource_scenario = self._make_dataset_resource_scenario(recorder.name,
+        resource_scenario = self._make_dataset_resource_scenario(attribute_name,
                                                                  value,
                                                                  data_type,
                                                                  resource_attribute_id,
@@ -522,7 +784,7 @@ class PywrHydraRunner(HydraToPywrNetwork):
         attr_name_map = {}
         for templatetype in self.template.templatetypes:
             for typeattr in templatetype.typeattrs:
-                attr = self.hydra.get_attribute_by_id(typeattr.attr_id)
+                attr = self.attributes[typeattr.attr_id]
                 attr_name_map[attr.name] = attr
                 #populate the dimension mapping
                 self.attr_dimension_map[attr.name] = attr.dimension_id

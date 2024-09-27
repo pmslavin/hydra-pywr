@@ -1,19 +1,16 @@
 import click
-import json
-import os
 import pandas
-from urllib.parse import urlparse
 
 from hydra_client.connection import RemoteJSONConnection
-from pywrparser.lib import PywrTypeJSONEncoder
-from pywrparser.types.network import PywrNetwork
-from .exporter import HydraToPywrNetwork
-from .importer import PywrToHydraNetwork
-from .runner import PywrHydraRunner, PywrFileRunner
+
+from hydra_client.click import hydra_app, make_plugins, write_plugins
+
+from . import runner
+from . import exporter
+from . import importer
 
 from .template import register_template, unregister_template, migrate_network_template, TemplateExistsError
 from . import utils
-from hydra_client.click import hydra_app, make_plugins, write_plugins
 
 
 def get_client(**kwargs):
@@ -22,7 +19,7 @@ def get_client(**kwargs):
 
 def get_logged_in_client(context):
     session = context.get("session")
-    client = get_client(session_id=session)
+    client = get_client(url=context.get('hostname'), session_id=session)
     if client.user_id is None and session is None:
         client.login(username=context["username"], password=context["password"])
     return client
@@ -54,54 +51,23 @@ def cli(obj, username, password, hostname, session):
 @click.pass_obj
 @click.option('--filename', type=click.Path(file_okay=True, dir_okay=False, exists=True))
 @click.option('-p', '--project-id', type=int)
-@click.option('-u', '--user-id', type=int, default=None)
 @click.option('--template-id', type=int)
 @click.option('--projection', type=str, default=None)
 @click.option('--network-name', type=str, default=None)
 @click.option('--rewrite-url-prefix', type=str, default=None)
-@click.option('--run/--no-run', default=False)
-@click.option('--solver', type=str, default=None)
-@click.option('--check-model/--no-check-model', default=True)
-@click.option('--ignore-type-errors', is_flag=True, default=False)
-def import_json(obj, filename, project_id, user_id, template_id, projection, network_name, rewrite_url_prefix, run, solver, check_model, ignore_type_errors, *args):
+def import_json(obj, filename, project_id, template_id, projection, network_name, rewrite_url_prefix, *args):
     """ Import a Pywr JSON file into Hydra. """
-    click.echo(f'Beginning import of "{filename}" to Project ID: {project_id}')
-
-    if filename is None:
-        raise Exception("No file specified")
-
-    if project_id is None:
-        raise Exception("No project specified")
-
-    if template_id is None:
-        raise Exception("No template specified")
-
-    pnet, errors, warnings = PywrNetwork.from_file(filename)
-    if warnings:
-        for component, warns in warnings.items():
-            for warn in warns:
-                click.echo(warn)
-
-    if errors:
-        for component, errs in errors.items():
-            for err in errs:
-                click.echo(err)
-        exit(1)
-
-    if network_name:
-        pnet.metadata.data["title"] = network_name
-
-    if rewrite_url_prefix:
-        from .utils import file_to_s3
-        for elem in [*pnet.parameters.values(), *pnet.tables.values()]:
-            file_to_s3(elem.data, rewrite_url_prefix)
 
     client = get_logged_in_client(obj)
-    importer = PywrToHydraNetwork(pnet, hydra=client, user_id=user_id, template_id=template_id, project_id=project_id)
-    importer.build_hydra_network(projection)
-    importer.add_network_to_hydra()
 
-    click.echo(f"Imported {filename} to Project ID: {project_id}")
+    importer.import_json(client,
+                         filename,
+                         project_id,
+                         template_id,
+                         network_name,
+                         *args,
+                         rewrite_url_prefix=rewrite_url_prefix,
+                         projection=projection)
 
 
 @hydra_app(category='export', name='Export to Pywr JSON')
@@ -111,38 +77,18 @@ def import_json(obj, filename, project_id, user_id, template_id, projection, net
 @click.pass_obj
 @click.option('--data-dir', default='/tmp')
 @click.option('-s', '--scenario-id', type=int, default=None)
-@click.option('-u', '--user-id', type=int, default=None)
 @click.option('--use-cache', is_flag=True)
 @click.option('--json-sort-keys/--no-json-sort-keys', default=False)
 @click.option('--json-indent', type=int, default=2)
-def export_json(obj, data_dir, scenario_id, user_id, use_cache, json_sort_keys, json_indent):
+def export_json(obj, data_dir, scenario_id, use_cache, json_sort_keys, json_indent):
     """ Export a Pywr JSON from Hydra. """
-
     client = get_logged_in_client(obj)
-    exporter = HydraToPywrNetwork.from_scenario_id(client, scenario_id, use_cache=use_cache)
-    network_data = exporter.build_pywr_network()
-    network_id = exporter.data.id
-    pywr_network = PywrNetwork(network_data)
-
-    pywr_network.promote_inline_parameters()
-    pywr_network.detach_parameters()
-
-    url_refs = pywr_network.url_references()
-    for url, refs in url_refs.items():
-        u = urlparse(url)
-        if u.scheme == "s3":
-            filedest = utils.retrieve_s3(url, data_dir)
-        elif u.scheme.startswith("http"):
-            filedest = utils.retrieve_url(url, data_dir)
-        for ref in refs:
-            ref.data["url"] = filedest
-
-    pnet_title = pywr_network.metadata.data["title"]
-    outfile = os.path.join(data_dir, f"{pnet_title.replace(' ', '_')}.json")
-    with open(outfile, mode='w') as fp:
-        json.dump(pywr_network.as_dict(), fp, sort_keys=json_sort_keys, indent=2, cls=PywrTypeJSONEncoder)
-
-    click.echo(f"Network: {network_id}, Scenario: {scenario_id} exported to `{outfile}`")
+    exporter.export_json(client,
+                         data_dir,
+                         scenario_id,
+                         use_cache,
+                         json_sort_keys,
+                         json_indent)
 
 
 @cli.command(name="run-file", context_settings=dict(
@@ -153,10 +99,7 @@ def export_json(obj, data_dir, scenario_id, user_id, use_cache, json_sort_keys, 
 @click.option('--domain', type=str, default="water")
 @click.option('--output-file', type=str, default="output.csv")
 def run_file(obj, filename, domain, output_file):
-    pfr = PywrFileRunner(domain)
-    pfr.load_pywr_model_from_file(filename)
-    pfr.run_pywr_model(output_file)
-
+    runner.run_file(filename, domain, output_file)
 
 @cli.command(name="purge-cache", context_settings=dict(
     ignore_unknown_options=True,
@@ -175,74 +118,24 @@ def purge_cache(cache_path):
 @click.pass_obj
 @click.option('-s', '--scenario-id', type=int, default=None)
 @click.option('-t', '--template-id', type=int, default=None)
-@click.option('-u', '--user-id', type=int, default=None)
 @click.option('--domain', type=str, default="water")
 @click.option('--output-frequency', type=str, default=None)
 @click.option('--solver', type=str, default=None)
-@click.option('--data-dir', default=None)
-def run(obj, scenario_id, template_id, user_id, domain, output_frequency, solver, data_dir):
+@click.option('--data-dir', default='/tmp')
+def run(obj, scenario_id, template_id, domain, output_frequency, solver, data_dir):
     """ Export, run and save a Pywr model from Hydra. """
     client = get_logged_in_client(obj)
 
     if scenario_id is None:
         raise Exception('No scenario specified')
 
-    run_network_scenario(client, scenario_id, template_id, domain, output_frequency=output_frequency,
-                         solver=solver, data_dir=data_dir)
-
-
-def run_network_scenario(client, scenario_id, template_id, domain, output_frequency=None, solver=None, data_dir=None):
-
-    runner = PywrHydraRunner.from_scenario_id(client, scenario_id,
-                                             template_id=template_id)
-
-    network_data = runner.build_pywr_network()
-    pywr_network = PywrNetwork(network_data)
-    pywr_network.promote_inline_parameters()
-    pywr_network.detach_parameters()
-
-    url_refs = pywr_network.url_references()
-    for url, refs in url_refs.items():
-        u = urlparse(url)
-        if u.scheme == "s3":
-            filedest = utils.retrieve_s3(url, data_dir)
-        elif u.scheme.startswith("http"):
-            filedest = utils.retrieve_url(url, data_dir)
-        for ref in refs:
-            ref.data["url"] = filedest
-
-    pywr_data = runner.load_pywr_model(pywr_network, solver=solver)
-
-    network_id = runner.data.id
-
-    if data_dir is not None:
-        save_pywr_file(pywr_data, data_dir, network_id, scenario_id)
-
-    runner.run_pywr_model()
-    runner.save_pywr_results()
-
-    click.echo(f'Pywr model run success. Network ID: {network_id}, Scenario ID: {scenario_id}')
-
-
-def save_pywr_file(data, data_dir, network_id=None, scenario_id=None):
-    """
-    Save pywr json data to the specified directory
-    """
-    if data_dir is None:
-        click.echo("No data dir specified. Returning.")
-
-    title = data['metadata']['title']
-
-    #check if the output folder exists and create it if not
-    if not os.path.isdir(data_dir):
-        #exist_ok sets unix the '-p' functionality to create the whole path
-        os.makedirs(data_dir, exist_ok=True)
-
-    filename = os.path.join(data_dir, f'{title}.json')
-    with open(filename, mode='w') as fh:
-        json.dump(data, fh, sort_keys=True, indent=2)
-
-    click.echo(f'Successfully exported "{filename}". Network ID: {network_id}, Scenario ID: {scenario_id}')
+    runner.run_network_scenario(client,
+                                scenario_id,
+                                template_id,
+                                domain,
+                                output_frequency=output_frequency,
+                                solver=solver,
+                                data_dir=data_dir)
 
 
 """
@@ -256,8 +149,7 @@ def save_pywr_file(data, data_dir, network_id=None, scenario_id=None):
 @click.option('-n', '--network-id', type=int, default=None)
 @click.option('-s', '--scenario-id', type=int, default=None)
 @click.option('--child-scenario-ids', type=int, default=None, multiple=True)
-@click.option('-u', '--user-id', type=int, default=None)
-def step_model(obj, network_id, scenario_id, child_scenario_ids, user_id):
+def step_model(obj, network_id, scenario_id, child_scenario_ids):
     client = get_logged_in_client(obj)
     utils.apply_final_volumes_as_initial_volumes(client, scenario_id, child_scenario_ids)
     utils.progress_start_end_dates(client, network_id, scenario_id)
@@ -270,8 +162,7 @@ def step_model(obj, network_id, scenario_id, child_scenario_ids, user_id):
 @click.pass_obj
 @click.option('-s', '--scenario-id', type=int, default=None)
 @click.option('--child-scenario-ids', type=int, default=None, multiple=True)
-@click.option('-u', '--user-id', type=int, default=None)
-def apply_initial_volumes_to_other_networks(obj, scenario_id, child_scenario_ids, user_id):
+def apply_initial_volumes_to_other_networks(obj, scenario_id, child_scenario_ids):
     client = get_logged_in_client(obj)
     utils.apply_final_volumes_as_initial_volumes(client, scenario_id, child_scenario_ids)
 
@@ -289,9 +180,8 @@ def apply_initial_volumes_to_other_networks(obj, scenario_id, child_scenario_ids
 @click.option('--column-name', type=str, default=None)
 @click.option('--data-type', type=str, default='PYWR_DATAFRAME')
 @click.option('--create-new/--no-create-new', default=False)
-@click.option('-u', '--user-id', type=int, default=None)
 def step_game(obj, scenario_id, child_scenario_ids, filename, attribute_name, index_col,
-              column_name, data_type, create_new, user_id):
+              column_name, data_type, create_new):
     client = get_logged_in_client(obj)
 
     # Create new scenarios in each of the networks

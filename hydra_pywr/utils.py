@@ -6,6 +6,8 @@ from hydra_network_utils import data as data_utils
 import logging
 log = logging.getLogger(__name__)
 
+
+
 def import_dataframe(client, dataframe, scenario_id, attribute_id, create_new=False, data_type='PYWR_DATAFRAME', column=None):
 
     scenario = client.get_scenario(scenario_id, include_data=False)
@@ -184,6 +186,10 @@ def add_interp_kwargs(param_data):
     """
     ptype = "interpolatedvolume"
     new_key = "interp_kwargs"
+
+    if param_data.get('type') is None:
+        return param_data
+
     if param_data["type"].lower().startswith(ptype) and "kind" in param_data:
         param_data[new_key] = {"kind": param_data["kind"]}
         del param_data["kind"]
@@ -205,7 +211,12 @@ def file_to_s3(elem_data, s3prefix):
 def url_to_local_path(url, datadir):
     u = urlparse(url)
     filepath = f"{u.netloc}{u.path}"
-    return os.path.join(datadir, filepath)
+
+    fullpath = os.path.join(datadir, filepath)
+
+    os.makedirs(os.path.dirname(fullpath), exist_ok=True)
+
+    return fullpath
 
 
 def retrieve_url(url, urldir):
@@ -247,9 +258,15 @@ def retrieve_s3(s3path, datadir):
     elif not os.path.isdir(datadir):
         raise OSError(f"Destination '{datadir}' is not a directory")
 
-    fs = s3fs.S3FileSystem(anon=True)
+    #assume credential are in the ~/.aws/credentials file
+    fs = s3fs.S3FileSystem()
     log.info(f"Retrieving {s3path} to {filedest} ...")
-    fs.get(s3path, filedest)
+
+    try:
+        fs.get(s3path, filedest)
+    except Exception as e:
+        raise Exception(f"Unable to access data in s3 bucket {s3path}. Error is {e}")
+
     log.info(f"Retrieved {filedest} ({os.stat(filedest).st_size} bytes)")
 
     return filedest

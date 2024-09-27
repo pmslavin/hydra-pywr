@@ -1,8 +1,13 @@
 import json
+import sys
 import os
 import re
 from collections import defaultdict
 from datetime import datetime
+from pywrparser.types.network import PywrNetwork
+import subprocess
+
+from urllib.parse import urlparse
 
 from pywrparser.types import (
     PywrParameter,
@@ -11,6 +16,7 @@ from pywrparser.types import (
     PywrMetadata,
     PywrTable,
     PywrScenario,
+    PywrScenarioCombination,
     PywrNode,
     PywrEdge
 )
@@ -18,13 +24,12 @@ from pywrparser.types import (
 from .config import CACHE_DIR
 from .rules import exec_rules
 from .template import PYWR_SPLIT_LINK_TYPES
-from .utils import (
-    unnest_parameter_key,
-    add_interp_kwargs
-)
+from . import utils
 
 from hydra_base.lib.objects import JSONObject
 from hydra_base.exceptions import ResourceNotFoundError
+
+from pywrparser.lib import PywrTypeJSONEncoder
 
 
 import logging
@@ -40,6 +45,52 @@ RECORDER_TYPES = (
 )
 
 
+def export_json(client, data_dir, scenario_id, use_cache, json_sort_keys, json_indent):
+    """
+        A utility function to uxport a Pywr JSON from Hydra.
+    """
+
+    exporter = HydraToPywrNetwork.from_scenario_id(client, scenario_id, use_cache=use_cache, data_dir=data_dir)
+    network_data = exporter.build_pywr_network()
+    network_id = exporter.data.id
+    pywr_network = PywrNetwork(network_data)
+
+    pywr_network.promote_inline_parameters()
+    pywr_network.detach_parameters()
+
+    url_refs = pywr_network.url_references()
+
+    for url, refs in url_refs.items():
+        u = urlparse(url)
+        filedest = url
+        if u.scheme == "s3":
+            filedest = utils.retrieve_s3(url, data_dir)
+        elif u.scheme.startswith("http"):
+            filedest = utils.retrieve_url(url, data_dir)
+        else:
+            #'/file.csv' -> ('', file.csv)
+            spliturl = url.strip(os.sep).split(os.sep)
+            #If the url is 'file.csv'
+            if len(spliturl) == 1:
+
+                full_path = exporter.filedict.get(spliturl[0])
+                if full_path is not None:
+                    filedest = utils.retrieve_s3(full_path, data_dir)
+            else:
+                log.debug("Not processing file %s", url)
+
+        for ref in refs:
+            ref.data["url"] = filedest
+
+    pnet_title = pywr_network.metadata.data["title"]
+    outfile = os.path.join(data_dir, f"{pnet_title.replace(' ', '_')}.json")
+    with open(outfile, mode='w') as fp:
+        json.dump(pywr_network.as_dict(), fp, sort_keys=json_sort_keys, indent=2, cls=PywrTypeJSONEncoder)
+
+    log.info(f"Network: {network_id}, Scenario: {scenario_id} exported to `{outfile}`")
+
+    return outfile
+
 """
     Hydra => PywrNetwork
 """
@@ -54,13 +105,15 @@ class HydraToPywrNetwork():
 
     scenario_combinations_attr_name = "scenario_combinations"
 
-    def __init__(self, client, network, network_id, scenario_id, attributes, template, **kwargs):
+    def __init__(self, client, network, network_id, scenario_id, attributes, template, data_dir='.', **kwargs):
         self.hydra = client
         self.data = network
         self.network_id = network_id
         self.scenario_id = scenario_id
         self.attributes = attributes
         self.template = template
+
+        self.data_dir = data_dir
 
         self.type_id_map = {}
         for tt in self.template.templatetypes:
@@ -100,9 +153,15 @@ class HydraToPywrNetwork():
                 with open(scen_cache_path, 'r') as fp:
                     scenario = JSONObject(json.load(fp))
             else:
-                    scenario = client.get_scenario(scenario_id=scenario_id, include_data=True, include_results=False, include_metadata=True, include_attr=False)
+                    scenario = client.get_scenario(scenario_id=scenario_id,
+                                                   include_data=True,
+                                                   include_results=False,
+                                                   include_metadata=True,
+                                                   include_attr=False)
+
                     with open(scen_cache_path, 'w') as fp:
                         json.dump(scenario, fp)
+
                     log.info(f"Cached scenario written to '{scen_cache_path}'")
 
             network_id = scenario.network_id
@@ -135,23 +194,25 @@ class HydraToPywrNetwork():
                         include_attributes=True)
 
         network.scenarios = [scenario]
-        network.rules = client.get_resource_rules(ref_key='NETWORK', scenario_id_id=scenario_id)
+        network.rules = client.get_resource_rules(ref_key='NETWORK', ref_id=network_id)
 
-        attributes = client.get_attributes()
+        attributes = client.get_attributes(network_id=network.id, project_id=network.project_id, include_global=True)
         attributes = {attr.id: attr for attr in attributes}
 
         log.info(f"Retreiving template {network.types[index].template_id}")
         template = client.get_template(template_id=network.types[index].template_id)
 
-        return cls(client, network, network_id, scenario_id, attributes, template)
+        return cls(client, network, network_id, scenario_id, attributes, template, kwargs.get('data_dir'))
 
 
     def write_rules_as_module(self):
-        filename = "hydra_pywr_custom_module.py"
+        filename = os.path.join(os.path.dirname(__file__), "hydra_pywr_custom_module.py")
 
         prelude = (
             "from pywr import recorders",
             "from pywr import parameters",
+            "from pywr.parameters import *",
+            "from pywr.recorders import *",
             "import pandas",
             "import numpy as np",
             "import scipy",
@@ -174,6 +235,8 @@ class HydraToPywrNetwork():
         sys.addaudithook(handler)
         """
 
+        log.info("Adding %s rules.", len(self.data.rules))
+
         with open(filename, 'w') as fp:
             for p in prelude:
                 fp.write(f"{p}\n")
@@ -185,11 +248,104 @@ class HydraToPywrNetwork():
                 fp.write(rule["value"])
                 fp.write("\n\n")
 
+    def get_external_files(self):
+        """
+            Request the locations of any external files from hydra, using the project appdata column,
+            then replace the relevant file names in the 'url' section of parameters and tables with the full path to the file.
+            for example replace:
+            {
+            ...
+            "url" : "demand.csv"
+            ...
+            }
+            with
+            {
+            ...
+            "url": "/path/to/demand.csv"
+            ...
+            }
+            where '/path/to' is defined in the project's metadata (the appdata column)
+        """
+        log.info("Retrieving external files")
+        try:
+            import s3fs
+        except ImportError:
+            log.error("Unable to check for external files on S3. Access to S3 requires the s3fs module")
+            raise
+
+        #assume credential are in the ~/.aws/credentials file
+        fs = s3fs.S3FileSystem()
+
+        #First get the project hierarchy
+        project_hierarchy = self.hydra.get_project_hierarchy(project_id=self.data['project_id'])
+
+        #start from the top down. Files with the same name, at a lower level
+        #take precedence.
+        project_hierarchy.reverse()
+
+        self.filedict = {}
+
+        for proj_in_hierarchy in project_hierarchy:
+            #Files uploaded to the USER_FILE_UPLOAD_DIR are synchronized with the USER_FILE_ROOT_DIR
+            #So they are then downloaded from the USER_FILE_ROOT_DIR
+            if proj_in_hierarchy.appdata is None:
+                continue
+            data_s3_bucket = proj_in_hierarchy.appdata.get('data_s3_bucket')
+
+            if data_s3_bucket is None:
+                return
+
+            project_data_path = proj_in_hierarchy.appdata.get('data_uuid')
+
+            if project_data_path is None:
+                continue
+
+            bucket_path = f"{data_s3_bucket}/data/projectdata/{project_data_path}"
+
+            try:
+                #create a mapping from the files nams in the project_data_path directory
+                #to to their full s3 path
+                projectfiles = fs.ls(bucket_path)
+                for s3filepath in projectfiles:
+                    self.filedict[os.path.basename(s3filepath)] = s3filepath
+            except (FileNotFoundError, PermissionError):
+                log.warning("Unable to access bucket %s. Continuing.", bucket_path)
+
+        log.info("External file mapping created for %s files", len(self.filedict))
+
+        return self.filedict
+
+
+    def sync_with_s3(self, s3_bucket_name, project_data_path):
+        """
+            Sync the data folder with the specified s3 bucket
+        """
+        log.info(f"Syncing with s3 bucket {s3_bucket_name}")
+
+        data_dir = os.path.join(self.data_dir, 'projectdata', project_data_path)
+
+        sync_command = f"aws s3 sync s3://{s3_bucket_name}/data/projectdata/{project_data_path} {data_dir}"
+
+        log.info(sync_command)
+
+        completedprocess = subprocess.run(sync_command, shell=True)
+        if completedprocess.returncode == 0:
+            log.info(f"Synced s3 bucket {s3_bucket_name}")
+        else:
+            log.warning(f"error syncing bucket {s3_bucket_name} : {completedprocess.stderr} ")
+
+        return data_dir
 
     def build_pywr_network(self):
         self.build_pywr_nodes()
         self.edges = self.build_edges()
-        self.parameters, self.recorders = self.build_parameters_recorders()
+
+        self.get_external_files()
+
+        parameters, recorders = self.build_parameters_recorders()
+        self.parameters.update(parameters)
+        self.recorders.update(recorders)
+
         self.tables = self.build_tables()
         self.timestepper = self.build_timestepper()
         self.metadata = self.build_metadata()
@@ -212,10 +368,10 @@ class HydraToPywrNetwork():
             if comment := node.get("description"):
                 pywr_node["comment"] = comment
 
-            pywr_node_type = node["types"][0]["name"]
+            pywr_node_type = node["types"][0]
 
             if pywr_node_type:
-                log.info(f"Building node <{node['name']}> as <{pywr_node_type}>")
+                log.debug(f"Building node <{node['name']}> as <{pywr_node_type['name']} ({pywr_node_type['id']})>")
                 self.build_node_and_references(node, pywr_node_type)
 
 
@@ -239,7 +395,7 @@ class HydraToPywrNetwork():
             if hydra_edge["types"][0]["name"].lower() == "slottededge":
                 for slot in ("src_slot", "dest_slot"):
                     slot_id = [attr.id for attr in hydra_edge["attributes"] if attr.name == slot][0]
-                    slot_ds = self.get_dataset_by_attr_id(slot_id)
+                    slot_ds = self.get_dataset_by_resource_attr_id(slot_id)
                     verts.append(slot_ds.value if slot_ds else None)
 
             edge = PywrEdge(verts)
@@ -252,7 +408,7 @@ class HydraToPywrNetwork():
         table_attr_prefix = "tbl_"
         table_subattrs = ("header", "index_col", "key", "url")
         for attr in self.data["attributes"]:
-            ds = self.get_dataset_by_attr_id(attr.id)
+            ds = self.get_dataset_by_resource_attr_id(attr.id)
             if not ds:
                 continue
             if ds["type"].upper().startswith("PYWR_TABLE"):
@@ -288,7 +444,7 @@ class HydraToPywrNetwork():
         ts_keys = ("start", "end", "timestep")
 
         for attr in self.data["attributes"]:
-            ds = self.get_dataset_by_attr_id(attr.id)
+            ds = self.get_dataset_by_resource_attr_id(attr.id)
             if ds and ds["type"].upper().startswith("PYWR_TIMESTEPPER"):
                 # New style Timestep type: single dictionary value
                 value = json.loads(ds["value"])
@@ -323,7 +479,7 @@ class HydraToPywrNetwork():
             "description": self.data['description']
         }
         for attr in self.data["attributes"]:
-            ds = self.get_dataset_by_attr_id(attr.id)
+            ds = self.get_dataset_by_resource_attr_id(attr.id)
             if ds and ds["type"].upper().startswith("PYWR_METADATA"):
                 # New style Metadata type: single dictionary value
                 value = json.loads(ds["value"])
@@ -364,42 +520,50 @@ class HydraToPywrNetwork():
 
 
     def build_scenario_combinations(self):
-        scenario_combinations = None
-        for attr in self.data["attributes"]:
-            """
-                Dataset type of PYWR_SCENARIO_COMBINATIONS exists, but some
-                combinations are specified as descriptors, so use attr name
-            """
-            if attr.name == self.__class__.scenario_combinations_attr_name:
-                if ds := self.get_dataset_by_attr_id(attr.id):
-                    scenario_combinations = json.loads(ds["value"])
+        try:
+            s_c_dataset = self.get_network_attr(self.scenario_id, self.data["id"], "scenario_combinations")
+
+            scenario_combinations = [ PywrScenarioCombination(sc) for sc in s_c_dataset["scenario_combinations"] ]
+        except (ResourceNotFoundError, ValueError, KeyError):
+            scenario_combinations = []
 
         return scenario_combinations
-
 
     def build_parameters_recorders(self):
         parameters = {} # {name: P()}
         recorders = {} # {name: R()}
 
-        for attr in self.data.attributes:
-            ds = self.get_dataset_by_attr_id(attr.id)
+        for resource_attr in filter(lambda x:x.attr_is_var!='Y', self.data.attributes):
+
+            attribute = self.attributes.get(resource_attr["attr_id"])
+
+            if attribute is None:
+                continue
+
+            ds = self.get_dataset_by_resource_attr_id(resource_attr.id)
+
             if not ds:
                 # This could raise instead, e.g...
                 #raise ValueError(f"No dataset found for attr name {attr.name} with id {attr.id}")
                 continue
-            if not ds["type"].startswith(PARAMETER_TYPES + RECORDER_TYPES):
+
+            #a name might have been set directly in the 'build_node_and_references' function to include the node name
+            name = resource_attr.get('name', attribute['name'])
+
+            if not ds["type"].upper().startswith(PARAMETER_TYPES + RECORDER_TYPES):
                 continue
-            if ds["type"].startswith(PARAMETER_TYPES):
-                value = json.loads(ds["value"])
-                value = unnest_parameter_key(value, key="pandas_kwargs")
-                value = add_interp_kwargs(value)
-                p = PywrParameter(ds["name"], value)
+
+            if ds["type"].upper().startswith(PARAMETER_TYPES):
+                value = json.loads(ds['value'])
+                value = utils.unnest_parameter_key(value, key="pandas_kwargs")
+                value = utils.add_interp_kwargs(value)
+                p = PywrParameter(name, value)
                 assert p.name not in parameters    # Disallow overwriting
                 parameters[p.name] = p
-            elif ds["type"].startswith(RECORDER_TYPES):
-                value = json.loads(ds["value"])
+            elif ds["type"].upper().startswith(RECORDER_TYPES):
+                value = json.loads(ds['value'])
                 try:
-                    r = PywrRecorder(ds["name"], value)
+                    r = PywrRecorder(name, value)
                 except:
                     raise ValueError(f"Dataset {ds['name']} is not a valid Recorder")
                 recorders[r.name] = r
@@ -428,11 +592,11 @@ class HydraToPywrNetwork():
         return attr_data # NB: String keys
 
 
-    def get_dataset_by_attr_id(self, attr_id):
+    def get_dataset_by_resource_attr_id(self, ra_id):
 
         scenario = self.data.scenarios[0]
         for rs in scenario.resourcescenarios:
-            if rs.resource_attr_id == attr_id:
+            if rs.resource_attr_id == ra_id:
                 return rs.dataset
 
     def _get_resource_scenario(self, resource_attribute_id):
@@ -447,7 +611,10 @@ class HydraToPywrNetwork():
 
     def build_node_and_references(self, nodedata, pywr_node_type):
 
-        for resource_attribute in nodedata["attributes"]:
+        node_type_attribute_names = [a.attr.name for a in self.type_id_map[pywr_node_type['id']].typeattrs]
+
+        for resource_attribute in filter(lambda x:x.attr_is_var!='Y', nodedata["attributes"]):
+
             attribute = self.attributes[resource_attribute["attr_id"]]
             try:
                 resource_scenario = self._get_resource_scenario(resource_attribute["id"])
@@ -465,11 +632,31 @@ class HydraToPywrNetwork():
 
             try:
                 typedval = json.loads(value)
+
+                #If this is a basic hydra dataframe, transform it into a pywr
+                #dataframe so the model can read it
+                if dataset_type.lower() == 'dataframe':
+                    typedval = {
+                        'type': 'dataframeparameter',
+                        'data': typedval,
+                    }
+
+                if isinstance(typedval, dict):
+                    typedval = utils.unnest_parameter_key(typedval, key="pandas_kwargs")
+                    typedval = utils.add_interp_kwargs(typedval)
             except json.decoder.JSONDecodeError as e:
                 typedval = value
-            nodedata[attribute_name] = typedval
 
-        nodedata["type"] = pywr_node_type
+            #If the attribute name is defined on the node type, put it on the node
+            if attribute_name in node_type_attribute_names:
+                nodedata[attribute_name] = typedval
+            else:
+                #Otherwise put it in the global paramter list, with a name that reflects the original source
+                #e.g. "__node name__:attribute_name"
+                resource_attribute['name'] = f"__{nodedata['name']}__:{attribute_name}"
+                self.data.attributes.append(resource_attribute)
+
+        nodedata["type"] = pywr_node_type['name']
         node_attr_data = {a:v for a,v in nodedata.items() if a not in self.exclude_hydra_attrs}
         position = {"geographic": [ nodedata.get("x",0), nodedata.get("y",0) ]}
         node_attr_data["position"] = position

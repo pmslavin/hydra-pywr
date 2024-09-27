@@ -17,11 +17,67 @@ from .datatypes import (
     lookup_recorder_hydra_datatype
 )
 
+from pywrparser.types.network import PywrNetwork
+
 from hydra_base.lib.objects import JSONObject
 
 import logging
 log = logging.getLogger(__name__)
 
+
+def import_json(client, filename, project_id, template_id, network_name, *args, rewrite_url_prefix=None, appdata={}, projection='EPSG:4326'):
+    """
+        A utility function to import a Pywr JSON file into Hydra
+    """
+
+    log.info(f'Beginning import of "{filename}" to Project ID: {project_id}')
+
+    if filename is None:
+        raise Exception("No file specified")
+
+    if project_id is None:
+        raise Exception("No project specified")
+
+    if template_id is None:
+        raise Exception("No template specified")
+
+    pnet, errors, warnings = PywrNetwork.from_file(filename)
+    if warnings:
+        for component, warns in warnings.items():
+            for warn in warns:
+                log.info(warn)
+
+    if errors:
+        for component, errs in errors.items():
+            for err in errs:
+                log.info(err)
+        exit(1)
+
+    if pnet:
+        pnet.add_parameter_references()
+        pnet.add_recorder_references()
+        pnet.promote_inline_parameters()
+        pnet.promote_inline_recorders()
+        pnet.attach_reference_parameters()
+        pnet.attach_reference_recorders()
+        #pnet.detach_parameters()
+
+
+    if network_name:
+        pnet.metadata.data["title"] = network_name
+
+    if rewrite_url_prefix:
+        from .utils import file_to_s3
+        for elem in [*pnet.parameters.values(), *pnet.tables.values()]:
+            file_to_s3(elem.data, rewrite_url_prefix)
+
+    importer = PywrToHydraNetwork(pnet, hydra=client, template_id=template_id, project_id=project_id)
+    importer.build_hydra_network(projection, appdata=appdata)
+    network_summary = importer.add_network_to_hydra()
+
+    log.info(f"Imported {filename} to Project ID: {project_id}")
+
+    return network_summary
 
 class PywrTypeEncoder(json.JSONEncoder):
     def default(self, inst):
@@ -43,14 +99,13 @@ class PywrToHydraNetwork():
                        hydra=None,
                        hostname=None,
                        session_id=None,
-                       user_id=None,
                        template_id=None,
                        project_id=None):
         self.hydra = hydra
         self.network = network
         self.hostname = hostname
         self.session_id = session_id
-        self.user_id = user_id
+        self.user_id = hydra.user_id
         self.template_id = template_id
         self.project_id = project_id
 
@@ -118,7 +173,7 @@ class PywrToHydraNetwork():
         self.template = self.hydra.get_template(template_id=self.template_id)
 
 
-    def build_hydra_network(self, projection=None):
+    def build_hydra_network(self, projection=None, appdata={}):
         if projection:
             self.projection = projection
         else:
@@ -160,6 +215,7 @@ class PywrToHydraNetwork():
             "nodes": self.hydra_nodes,
             "links": self.hydra_links,
             "layout": None,
+            "appdata": appdata,
             "scenarios": [baseline_scenario],
             "projection": self.projection,
             "attributes": self.network_attributes,
@@ -197,6 +253,16 @@ class PywrToHydraNetwork():
             hydra_network_attrs.append(ra)
             resource_scenarios.append(rs)
 
+        scenario_combinations = [ s_c.data for s_c in self.network.scenario_combinations ]
+        if scenario_combinations:
+            attr_name = "scenario_combinations"
+            ra, rs = self.make_direct_resource_attr_and_scenario(
+                    {'scenario_combinations': scenario_combinations},
+                    attr_name,
+                    "PYWR_SCENARIO_COMBINATIONS"
+            )
+            hydra_network_attrs.append(ra)
+            resource_scenarios.append(rs)
         return hydra_network_attrs, resource_scenarios
 
     def collect_template_attributes(self):
@@ -209,7 +275,7 @@ class PywrToHydraNetwork():
         return template_attrs
 
     def register_hydra_attributes(self):
-        typed_network_attrs = { "timestepper", "metadata", "scenarios" }
+        typed_network_attrs = { "timestepper", "metadata", "scenarios", "scenario_combinations" }
         excluded_attrs = { 'position', 'type' }
         pending_attrs = typed_network_attrs
 
@@ -406,7 +472,14 @@ class PywrToHydraNetwork():
             if "position" in node.data:
                 proj_data = node.data["position"]
                 for coords in proj_data.values():
-                    x, y = coords[0], coords[1]
+                    if "geographic" in coords:
+                        coords = coords["geographic"]
+                    elif "schematic" in coords:
+                        coords = coords["schematic"]
+                    if isinstance(coords, list):
+                        x, y = coords[0], coords[1]
+                    elif isinstance(coords, dict):
+                        hydra_node['layout']['geojson'] = coords
                 hydra_node["x"] = x
                 hydra_node["y"] = y
             else:
@@ -491,7 +564,8 @@ class PywrToHydraNetwork():
     def add_network_to_hydra(self):
         """ Pass network to Hydra"""
         network = JSONObject(self.hydra_network)
-        self.hydra.add_network({"net": network})
+        network_summary = self.hydra.add_network({"net": network})
+        return network_summary
 
 
 """
